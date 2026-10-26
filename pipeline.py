@@ -2,30 +2,39 @@
 import logging
 import os
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
+
+from datetime import datetime, timezone
 
 import psycopg
 import requests
+
 from dotenv import load_dotenv
 
+from storage import (
+    get_s3_client,
+    ensure_bucket,
+    save_raw_json,
+)
 
-# --------------------------------------------------
+
+# ============================================================
 # 1. CONFIGURATION
-# --------------------------------------------------
+# ============================================================
 
 load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.open-meteo.com/v1/forecast"
-TIMEZONE = ZoneInfo("Africa/Casablanca")
+
+MAX_RETRIES = 3
+REQUEST_TIMEOUT = 30
 
 CITIES = {
     "Casablanca": (33.59, -7.62),
@@ -48,111 +57,156 @@ HOURLY_FIELDS = [
 ]
 
 
-# --------------------------------------------------
-# 2. EXTRACTION
-# --------------------------------------------------
+# ============================================================
+# 2. EXTRACTION - OPEN-METEO API
+# ============================================================
 
 def extract(session, city, latitude, longitude):
+
     params = {
         "latitude": latitude,
         "longitude": longitude,
         "hourly": ",".join(HOURLY_FIELDS),
-        "timezone": "Africa/Casablanca",
+        "timezone": "GMT",
+        "timeformat": "unixtime",
         "forecast_days": 1,
     }
 
-    max_attempts = 3
+    for attempt in range(1, MAX_RETRIES + 1):
 
-    for attempt in range(1, max_attempts + 1):
         try:
+            logger.info(
+                "EXTRACT | %s | tentative %s/%s",
+                city,
+                attempt,
+                MAX_RETRIES,
+            )
+
             response = session.get(
                 API_URL,
                 params=params,
-                timeout=20,
+                timeout=REQUEST_TIMEOUT,
             )
 
-            # Les erreurs HTTP 4xx/5xx deviennent
-            # des exceptions Python.
             response.raise_for_status()
 
-            return response.json()
+            data = response.json()
 
-        except (requests.RequestException, ValueError) as error:
-            # 429 = limite de requêtes
-            # 5xx = erreur du serveur
-            # Erreurs réseau = pas de réponse HTTP
-            status = (
-                error.response.status_code
-                if isinstance(error, requests.HTTPError)
-                and error.response is not None
+            return data
+
+        except (requests.RequestException, ValueError) as exc:
+
+            status_code = (
+                exc.response.status_code
+                if isinstance(exc, requests.HTTPError)
+                and exc.response is not None
                 else None
             )
 
             retryable = (
-                not isinstance(error, requests.HTTPError)
-                or status == 429
-                or (status is not None and status >= 500)
+                status_code is None
+                or status_code == 429
+                or status_code >= 500
             )
 
-            if not retryable or attempt == max_attempts:
+            if not retryable or attempt == MAX_RETRIES:
                 raise
 
-            wait_seconds = 2 ** attempt
+            delay = 2 ** attempt
 
             logger.warning(
-                "%s | tentative %s/%s échouée : %s | "
-                "nouvel essai dans %ss",
+                "RETRY | %s | %s | attente %ss",
                 city,
-                attempt,
-                max_attempts,
-                error,
-                wait_seconds,
+                exc,
+                delay,
             )
 
-            time.sleep(wait_seconds)
+            time.sleep(delay)
 
 
-# --------------------------------------------------
-# 3. TRANSFORMATION
-# --------------------------------------------------
+# ============================================================
+# 3. RAW DATA - SEAWEEDFS DATA LAKE
+# ============================================================
 
-def transform(city, payload):
-    hourly = payload["hourly"]
+def save_to_data_lake(s3_client, city, data, run_date):
+
+    key = save_raw_json(
+        s3_client,
+        city,
+        data,
+        run_date,
+    )
+
+    logger.info(
+        "RAW SAVED | %s | bucket=meteo-raw | key=%s",
+        city,
+        key,
+    )
+
+    return key
+
+
+# ============================================================
+# 4. TRANSFORMATION
+# ============================================================
+
+def transform(city, data):
+
+    hourly = data["hourly"]
+
     times = hourly["time"]
+    temperatures = hourly["temperature_2m"]
+    humidities = hourly["relative_humidity_2m"]
+    precipitations = hourly["precipitation"]
+    wind_speeds = hourly["wind_speed_10m"]
 
-    # Toutes les séries doivent correspondre
-    # aux mêmes positions horaires.
-    for field in HOURLY_FIELDS:
-        if len(hourly[field]) != len(times):
-            raise ValueError(
-                f"{city}: longueur incohérente pour {field}"
-            )
+    expected_length = len(times)
+
+    if not all(
+        len(values) == expected_length
+        for values in (
+            temperatures,
+            humidities,
+            precipitations,
+            wind_speeds,
+        )
+    ):
+        raise ValueError(
+            f"Tailles des tableaux incohérentes pour {city}"
+        )
 
     rows = []
 
-    for index, time_string in enumerate(times):
-        # Open-Meteo retourne des heures locales.
-        local_datetime = datetime.fromisoformat(
-            time_string
-        ).replace(tzinfo=TIMEZONE)
+    for i in range(expected_length):
+
+        observed_at = datetime.fromtimestamp(
+            times[i],
+            tz=timezone.utc,
+        )
 
         row = (
             city,
-            local_datetime,
-            hourly["temperature_2m"][index],
-            hourly["relative_humidity_2m"][index],
-            hourly["precipitation"][index],
-            hourly["wind_speed_10m"][index],
+            observed_at,
+            temperatures[i],
+            humidities[i],
+            precipitations[i],
+            wind_speeds[i],
         )
 
         rows.append(row)
 
+    logger.info(
+        "TRANSFORM | %s | %s observations",
+        city,
+        len(rows),
+    )
+
     return rows
 
 
-# --------------------------------------------------
-# 4. CHARGEMENT
-# --------------------------------------------------
+# ============================================================
+# 5. POSTGRESQL UPSERT
+# ============================================================
 
 UPSERT_SQL = """
 INSERT INTO weather_observations (
@@ -164,7 +218,9 @@ INSERT INTO weather_observations (
     wind_speed_kmh
 )
 VALUES (%s, %s, %s, %s, %s, %s)
+
 ON CONFLICT (city, observed_at)
+
 DO UPDATE SET
     temperature_c = EXCLUDED.temperature_c,
     humidity_pct = EXCLUDED.humidity_pct,
@@ -174,81 +230,139 @@ DO UPDATE SET
 
 
 def load(rows):
+
     if not rows:
         return 0
 
     with psycopg.connect(
-        host=os.environ["POSTGRES_HOST"],
-        port=int(os.environ["POSTGRES_PORT"]),
+        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        port=int(os.getenv("POSTGRES_PORT", "5433")),
         dbname=os.environ["POSTGRES_DB"],
         user=os.environ["POSTGRES_USER"],
         password=os.environ["POSTGRES_PASSWORD"],
         connect_timeout=10,
-    ) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(UPSERT_SQL, rows)
+    ) as conn:
 
-    # Le bloc connection valide la transaction
-    # si aucune exception n'a été levée.
+        with conn.cursor() as cur:
+            cur.executemany(
+                UPSERT_SQL,
+                rows,
+            )
+
     return len(rows)
 
 
-# --------------------------------------------------
-# 5. ORCHESTRATION
-# --------------------------------------------------
+# ============================================================
+# 6. PIPELINE ORCHESTRATION
+# ============================================================
 
 def main():
-    success_count = 0
-    failure_count = 0
+
+    successful_cities = 0
+    failed_cities = 0
     total_rows = 0
 
-    logger.info("Démarrage du pipeline météo : %s villes", len(CITIES))
+    run_date = datetime.now(timezone.utc).date().isoformat()
+
+    logger.info("=" * 60)
+    logger.info("START WEATHER ETL PIPELINE")
+    logger.info("RUN DATE UTC | %s", run_date)
+    logger.info("CITIES | %s", len(CITIES))
+    logger.info("=" * 60)
+
+    # Initialize SeaweedFS before processing cities.
+    # If the data lake is unavailable, do not load PostgreSQL.
+
+    try:
+        s3_client = get_s3_client()
+        ensure_bucket(s3_client)
+
+        logger.info(
+            "DATA LAKE READY | bucket=meteo-raw"
+        )
+
+    except Exception:
+        logger.exception(
+            "DATA LAKE UNAVAILABLE | pipeline stopped"
+        )
+        raise SystemExit(1)
+
+    # Reuse the HTTP session for all cities.
 
     with requests.Session() as session:
+
         for city, (latitude, longitude) in CITIES.items():
-            logger.info("%s | début du traitement", city)
+
+            logger.info("-" * 60)
+            logger.info("CITY START | %s", city)
 
             try:
-                payload = extract(
-                    session, city, latitude, longitude
+
+                # STEP 1: Extract raw JSON from Open-Meteo.
+
+                data = extract(
+                    session,
+                    city,
+                    latitude,
+                    longitude,
                 )
 
-                rows = transform(city, payload)
+                # STEP 2: Save JSON to SeaweedFS FIRST.
+                # If this fails, PostgreSQL is not loaded.
+
+                save_to_data_lake(
+                    s3_client,
+                    city,
+                    data,
+                    run_date,
+                )
+
+                # STEP 3: Transform JSON into database rows.
+
+                rows = transform(
+                    city,
+                    data,
+                )
+
+                # STEP 4: Load into PostgreSQL.
 
                 loaded = load(rows)
 
-                success_count += 1
+                successful_cities += 1
                 total_rows += loaded
 
                 logger.info(
-                    "%s | succès | %s lignes chargées",
+                    "SUCCESS | %s | %s rows processed",
                     city,
                     loaded,
                 )
 
-            except Exception as error:
-                failure_count += 1
+            except Exception:
 
-                logger.error(
-                    "%s | échec | %s: %s",
+                failed_cities += 1
+
+                logger.exception(
+                    "FAILED | %s",
                     city,
-                    type(error).__name__,
-                    error,
                 )
 
-                # On continue avec la ville suivante.
+                # Continue with the next city.
                 continue
 
-    logger.info(
-        "BILAN | succès=%s | échecs=%s | lignes=%s",
-        success_count,
-        failure_count,
-        total_rows,
-    )
+    logger.info("=" * 60)
+    logger.info("PIPELINE FINISHED")
+    logger.info("Successful cities : %s", successful_cities)
+    logger.info("Failed cities     : %s", failed_cities)
+    logger.info("Rows processed    : %s", total_rows)
+    logger.info("=" * 60)
 
-    if failure_count:
+    if failed_cities:
         raise SystemExit(1)
 
+
+# ============================================================
+# 7. ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()

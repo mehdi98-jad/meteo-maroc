@@ -9,6 +9,14 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: server -s3 -dir=/data -ip.bind=0.0.0.0
+    ports:
+      - "127.0.0.1:8333:8333"
+      - "127.0.0.1:9333:9333"
+    volumes:
+      - seaweedfs_data:/data 
 volumes:
   postgres_data:
+  seaweedfs_data:
