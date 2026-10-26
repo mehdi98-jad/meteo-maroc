@@ -1,12 +1,9 @@
-
-
 import json
 import os
 import re
 
 import boto3
 from botocore.config import Config
-
 
 BUCKET_NAME = "meteo-raw"
 
@@ -30,7 +27,6 @@ def get_s3_client():
     )
 
 
-
 def ensure_bucket(client):
     """Vérifier que le bucket existe, sinon le créer."""
 
@@ -50,7 +46,6 @@ def ensure_bucket(client):
             raise
 
 
-
 def save_raw_json(client, city, data, run_date):
     """Sauvegarder le JSON brut dans SeaweedFS."""
 
@@ -62,12 +57,7 @@ def save_raw_json(client, city, data, run_date):
         city_slug,
     ).strip("-")
 
-    key = (
-        f"source=open-meteo/"
-        f"date={run_date}/"
-        f"city={city_slug}/"
-        f"forecast.json"
-    )
+    key = f"source=open-meteo/date={run_date}/city={city_slug}/forecast.json"
 
     body = json.dumps(
         data,

@@ -1,21 +1,17 @@
-
 import logging
 import os
 import time
-
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import psycopg
 import requests
-
 from dotenv import load_dotenv
 
 from storage import (
-    get_s3_client,
     ensure_bucket,
+    get_s3_client,
     save_raw_json,
 )
-
 
 # ============================================================
 # 1. CONFIGURATION
@@ -61,6 +57,7 @@ HOURLY_FIELDS = [
 # 2. EXTRACTION - OPEN-METEO API
 # ============================================================
 
+
 def extract(session, city, latitude, longitude):
 
     params = {
@@ -73,7 +70,6 @@ def extract(session, city, latitude, longitude):
     }
 
     for attempt in range(1, MAX_RETRIES + 1):
-
         try:
             logger.info(
                 "EXTRACT | %s | tentative %s/%s",
@@ -95,24 +91,18 @@ def extract(session, city, latitude, longitude):
             return data
 
         except (requests.RequestException, ValueError) as exc:
-
             status_code = (
                 exc.response.status_code
-                if isinstance(exc, requests.HTTPError)
-                and exc.response is not None
+                if isinstance(exc, requests.HTTPError) and exc.response is not None
                 else None
             )
 
-            retryable = (
-                status_code is None
-                or status_code == 429
-                or status_code >= 500
-            )
+            retryable = status_code is None or status_code == 429 or status_code >= 500
 
             if not retryable or attempt == MAX_RETRIES:
                 raise
 
-            delay = 2 ** attempt
+            delay = 2**attempt
 
             logger.warning(
                 "RETRY | %s | %s | attente %ss",
@@ -127,6 +117,7 @@ def extract(session, city, latitude, longitude):
 # ============================================================
 # 3. RAW DATA - SEAWEEDFS DATA LAKE
 # ============================================================
+
 
 def save_to_data_lake(s3_client, city, data, run_date):
 
@@ -150,6 +141,7 @@ def save_to_data_lake(s3_client, city, data, run_date):
 # 4. TRANSFORMATION
 # ============================================================
 
+
 def transform(city, data):
 
     hourly = data["hourly"]
@@ -171,17 +163,14 @@ def transform(city, data):
             wind_speeds,
         )
     ):
-        raise ValueError(
-            f"Tailles des tableaux incohérentes pour {city}"
-        )
+        raise ValueError(f"Tailles des tableaux incohérentes pour {city}")
 
     rows = []
 
     for i in range(expected_length):
-
         observed_at = datetime.fromtimestamp(
             times[i],
-            tz=timezone.utc,
+            tz=UTC,
         )
 
         row = (
@@ -234,20 +223,21 @@ def load(rows):
     if not rows:
         return 0
 
-    with psycopg.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=int(os.getenv("POSTGRES_PORT", "5433")),
-        dbname=os.environ["POSTGRES_DB"],
-        user=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        connect_timeout=10,
-    ) as conn:
-
-        with conn.cursor() as cur:
-            cur.executemany(
-                UPSERT_SQL,
-                rows,
-            )
+    with (
+        psycopg.connect(
+            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+            port=int(os.getenv("POSTGRES_PORT", "5433")),
+            dbname=os.environ["POSTGRES_DB"],
+            user=os.environ["POSTGRES_USER"],
+            password=os.environ["POSTGRES_PASSWORD"],
+            connect_timeout=10,
+        ) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.executemany(
+            UPSERT_SQL,
+            rows,
+        )
 
     return len(rows)
 
@@ -256,13 +246,14 @@ def load(rows):
 # 6. PIPELINE ORCHESTRATION
 # ============================================================
 
+
 def main():
 
     successful_cities = 0
     failed_cities = 0
     total_rows = 0
 
-    run_date = datetime.now(timezone.utc).date().isoformat()
+    run_date = datetime.now(UTC).date().isoformat()
 
     logger.info("=" * 60)
     logger.info("START WEATHER ETL PIPELINE")
@@ -277,27 +268,20 @@ def main():
         s3_client = get_s3_client()
         ensure_bucket(s3_client)
 
-        logger.info(
-            "DATA LAKE READY | bucket=meteo-raw"
-        )
+        logger.info("DATA LAKE READY | bucket=meteo-raw")
 
     except Exception:
-        logger.exception(
-            "DATA LAKE UNAVAILABLE | pipeline stopped"
-        )
+        logger.exception("DATA LAKE UNAVAILABLE | pipeline stopped")
         raise SystemExit(1)
 
     # Reuse the HTTP session for all cities.
 
     with requests.Session() as session:
-
         for city, (latitude, longitude) in CITIES.items():
-
             logger.info("-" * 60)
             logger.info("CITY START | %s", city)
 
             try:
-
                 # STEP 1: Extract raw JSON from Open-Meteo.
 
                 data = extract(
@@ -338,7 +322,6 @@ def main():
                 )
 
             except Exception:
-
                 failed_cities += 1
 
                 logger.exception(

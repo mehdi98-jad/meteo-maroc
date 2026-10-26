@@ -1,16 +1,12 @@
-
+import calendar
 import logging
 import os
 import time
-import calendar
-
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import psycopg
 import requests
-
 from dotenv import load_dotenv
-
 
 # ============================================================
 # 1. CONFIGURATION
@@ -59,6 +55,7 @@ HOURLY_FIELDS = [
 # 2. GENERATION DES PERIODES MENSUELLES
 # ============================================================
 
+
 def generate_months(start_year, end_year):
     for year in range(start_year, end_year + 1):
         for month in range(1, 13):
@@ -74,8 +71,8 @@ def generate_months(start_year, end_year):
 # 3. EXTRACTION
 # ============================================================
 
-def extract(session, city, latitude, longitude,
-            start_date, end_date):
+
+def extract(session, city, latitude, longitude, start_date, end_date):
 
     params = {
         "latitude": latitude,
@@ -109,24 +106,18 @@ def extract(session, city, latitude, longitude,
             return response.json()
 
         except (requests.RequestException, ValueError) as exc:
-
             status_code = (
                 exc.response.status_code
-                if isinstance(exc, requests.HTTPError)
-                and exc.response is not None
+                if isinstance(exc, requests.HTTPError) and exc.response is not None
                 else None
             )
 
-            retryable = (
-                status_code is None
-                or status_code == 429
-                or status_code >= 500
-            )
+            retryable = status_code is None or status_code == 429 or status_code >= 500
 
             if not retryable or attempt == MAX_RETRIES:
                 raise
 
-            delay = 2 ** attempt
+            delay = 2**attempt
 
             logger.warning(
                 "RETRY | %s | erreur : %s | attente %ss",
@@ -141,6 +132,7 @@ def extract(session, city, latitude, longitude,
 # ============================================================
 # 4. TRANSFORMATION
 # ============================================================
+
 
 def transform(city, data):
 
@@ -163,17 +155,14 @@ def transform(city, data):
             wind_speeds,
         )
     ):
-        raise ValueError(
-            f"Tableaux météo de tailles différentes pour {city}"
-        )
+        raise ValueError(f"Tableaux météo de tailles différentes pour {city}")
 
     rows = []
 
     for i in range(expected_length):
-
         observed_at = datetime.fromtimestamp(
             times[i],
-            tz=timezone.utc,
+            tz=UTC,
         )
 
         row = (
@@ -220,17 +209,18 @@ def load(rows):
     if not rows:
         return 0
 
-    with psycopg.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=int(os.getenv("POSTGRES_PORT", "5433")),
-        dbname=os.environ["POSTGRES_DB"],
-        user=os.environ["POSTGRES_USER"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        connect_timeout=10,
-    ) as conn:
-
-        with conn.cursor() as cur:
-            cur.executemany(UPSERT_SQL, rows)
+    with (
+        psycopg.connect(
+            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+            port=int(os.getenv("POSTGRES_PORT", "5433")),
+            dbname=os.environ["POSTGRES_DB"],
+            user=os.environ["POSTGRES_USER"],
+            password=os.environ["POSTGRES_PASSWORD"],
+            connect_timeout=10,
+        ) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.executemany(UPSERT_SQL, rows)
 
     return len(rows)
 
@@ -238,6 +228,7 @@ def load(rows):
 # ============================================================
 # 6. ORCHESTRATION DU PIPELINE
 # ============================================================
+
 
 def main():
 
@@ -255,13 +246,10 @@ def main():
     )
 
     with requests.Session() as session:
-
         for city, (latitude, longitude) in CITIES.items():
-
             logger.info("CITY START | %s", city)
 
             for start_date, end_date in months:
-
                 try:
                     data = extract(
                         session,
