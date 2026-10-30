@@ -1,1 +1,40 @@
+# Secrets et configuration locale
 .env
+.env.*
+!.env.example
+
+# Environnements virtuels Python
+.venv/
+venv/
+
+# Python : fichiers compilés et caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# pytest
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# Outils de typage
+.mypy_cache/
+.pyright/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Éditeurs
+.vscode/
+.idea/
+
+# Fichiers temporaires
+*.log
+*.tmp
