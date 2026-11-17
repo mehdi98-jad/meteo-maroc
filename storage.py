@@ -5,21 +5,21 @@ import re
 import boto3
 from botocore.config import Config
 
-BUCKET_NAME = "meteo-raw"
+BUCKET_NAME = os.getenv("S3_BUCKET", "meteo-raw")
 
 
 def get_s3_client():
-    """Créer un client S3 connecté à SeaweedFS."""
+    """Créer un client S3 à partir des variables d'environnement."""
+
+    access_key = os.environ["S3_ACCESS_KEY"]
+    secret_key = os.environ["S3_SECRET_KEY"]
 
     return boto3.client(
         "s3",
-        endpoint_url=os.getenv(
-            "S3_ENDPOINT",
-            "http://127.0.0.1:8333",
-        ),
-        aws_access_key_id="local",
-        aws_secret_access_key="local",
-        region_name="us-east-1",
+        endpoint_url=os.getenv("S3_ENDPOINT", "http://127.0.0.1:8333"),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=os.getenv("S3_REGION", "us-east-1"),
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
