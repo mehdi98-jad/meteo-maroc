@@ -1,11 +1,31 @@
 import json
 import os
 import re
+import unicodedata
 
 import boto3
 from botocore.config import Config
 
 BUCKET_NAME = os.getenv("S3_BUCKET", "meteo-raw")
+
+def city_to_slug(city: str) -> str:
+    """Convertir un nom de ville en identifiant ASCII pour S3."""
+
+    normalized = unicodedata.normalize("NFKD", city)
+
+    without_accents = "".join(
+        char
+        for char in normalized
+        if not unicodedata.combining(char)
+    )
+
+    slug = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        without_accents.lower(),
+    ).strip("-")
+
+    return slug
 
 
 def get_s3_client():
@@ -49,13 +69,7 @@ def ensure_bucket(client):
 def save_raw_json(client, city, data, run_date):
     """Sauvegarder le JSON brut dans SeaweedFS."""
 
-    city_slug = city.lower()
-
-    city_slug = re.sub(
-        r"[^a-z0-9]+",
-        "-",
-        city_slug,
-    ).strip("-")
+    city_slug = city_to_slug(city)
 
     key = f"source=open-meteo/date={run_date}/city={city_slug}/forecast.json"
 
