@@ -1,12 +1,13 @@
 import calendar
 import logging
-import os
-import time
-from datetime import UTC, datetime
 
-import psycopg
 import requests
 from dotenv import load_dotenv
+
+from meteo.config import CITIES, HOURLY_FIELDS
+from meteo.database import connect_db, load_rows
+from meteo.extract import request_json_with_retry
+from meteo.transform import transform
 
 # ============================================================
 # 1. CONFIGURATION
@@ -27,28 +28,8 @@ API_URL = "https://archive-api.open-meteo.com/v1/archive"
 START_YEAR = 2016
 END_YEAR = 2025
 
-MAX_RETRIES = 3
 REQUEST_TIMEOUT = 60
 
-CITIES = {
-    "Casablanca": (33.59, -7.62),
-    "Rabat": (34.02, -6.84),
-    "Marrakech": (31.63, -8.00),
-    "Fès": (34.06, -4.98),
-    "Tanger": (35.76, -5.83),
-    "Agadir": (30.42, -9.60),
-    "Oujda": (34.68, -1.91),
-    "Meknès": (33.89, -5.55),
-    "Tétouan": (35.57, -5.37),
-    "Ouarzazate": (30.92, -6.91),
-}
-
-HOURLY_FIELDS = [
-    "temperature_2m",
-    "relative_humidity_2m",
-    "precipitation",
-    "wind_speed_10m",
-]
 
 
 # ============================================================
@@ -72,7 +53,9 @@ def generate_months(start_year, end_year):
 # ============================================================
 
 
+
 def extract(session, city, latitude, longitude, start_date, end_date):
+    """Extraire les données historiques pour une ville et une période."""
 
     params = {
         "latitude": latitude,
@@ -84,145 +67,14 @@ def extract(session, city, latitude, longitude, start_date, end_date):
         "timeformat": "unixtime",
     }
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            logger.info(
-                "EXTRACT | %s | %s -> %s | tentative %s/%s",
-                city,
-                start_date,
-                end_date,
-                attempt,
-                MAX_RETRIES,
-            )
+    return request_json_with_retry(
+        session=session,
+        url=API_URL,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+        context=f"{city} | {start_date} -> {end_date}",
+    )
 
-            response = session.get(
-                API_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            response.raise_for_status()
-
-            return response.json()
-
-        except (requests.RequestException, ValueError) as exc:
-            status_code = (
-                exc.response.status_code
-                if isinstance(exc, requests.HTTPError) and exc.response is not None
-                else None
-            )
-
-            retryable = status_code is None or status_code == 429 or status_code >= 500
-
-            if not retryable or attempt == MAX_RETRIES:
-                raise
-
-            delay = 2**attempt
-
-            logger.warning(
-                "RETRY | %s | erreur : %s | attente %ss",
-                city,
-                exc,
-                delay,
-            )
-
-            time.sleep(delay)
-
-
-# ============================================================
-# 4. TRANSFORMATION
-# ============================================================
-
-
-def transform(city, data):
-
-    hourly = data["hourly"]
-
-    times = hourly["time"]
-    temperatures = hourly["temperature_2m"]
-    humidities = hourly["relative_humidity_2m"]
-    precipitations = hourly["precipitation"]
-    wind_speeds = hourly["wind_speed_10m"]
-
-    expected_length = len(times)
-
-    if not all(
-        len(values) == expected_length
-        for values in (
-            temperatures,
-            humidities,
-            precipitations,
-            wind_speeds,
-        )
-    ):
-        raise ValueError(f"Tableaux météo de tailles différentes pour {city}")
-
-    rows = []
-
-    for i in range(expected_length):
-        observed_at = datetime.fromtimestamp(
-            times[i],
-            tz=UTC,
-        )
-
-        row = (
-            city,
-            observed_at,
-            temperatures[i],
-            humidities[i],
-            precipitations[i],
-            wind_speeds[i],
-        )
-
-        rows.append(row)
-
-    return rows
-
-
-# ============================================================
-# 5. CHARGEMENT POSTGRESQL
-# ============================================================
-
-UPSERT_SQL = """
-INSERT INTO weather_history (
-    city,
-    observed_at,
-    temperature_c,
-    humidity_pct,
-    precipitation_mm,
-    wind_speed_kmh
-)
-VALUES (%s, %s, %s, %s, %s, %s)
-
-ON CONFLICT (city, observed_at)
-
-DO UPDATE SET
-    temperature_c = EXCLUDED.temperature_c,
-    humidity_pct = EXCLUDED.humidity_pct,
-    precipitation_mm = EXCLUDED.precipitation_mm,
-    wind_speed_kmh = EXCLUDED.wind_speed_kmh;
-"""
-
-
-def load(rows):
-
-    if not rows:
-        return 0
-
-    with (
-        psycopg.connect(
-            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-            port=int(os.getenv("POSTGRES_PORT", "5433")),
-            dbname=os.environ["POSTGRES_DB"],
-            user=os.environ["POSTGRES_USER"],
-            password=os.environ["POSTGRES_PASSWORD"],
-            connect_timeout=10,
-        ) as conn,
-        conn.cursor() as cur,
-    ):
-        cur.executemany(UPSERT_SQL, rows)
-
-    return len(rows)
 
 
 # ============================================================
@@ -230,8 +82,8 @@ def load(rows):
 # ============================================================
 
 
-def main():
 
+def main():
     total_rows = 0
     successful_batches = 0
     failed_batches = 0
@@ -245,7 +97,10 @@ def main():
         len(CITIES) * len(months),
     )
 
-    with requests.Session() as session:
+    with (
+        requests.Session() as session,
+        connect_db() as conn,
+    ):
         for city, (latitude, longitude) in CITIES.items():
             logger.info("CITY START | %s", city)
 
@@ -262,7 +117,11 @@ def main():
 
                     rows = transform(city, data)
 
-                    loaded = load(rows)
+                    loaded = load_rows(
+                        conn,
+                        rows,
+                        "weather_history",
+                    )
 
                     total_rows += loaded
                     successful_batches += 1
@@ -284,7 +143,6 @@ def main():
                         start_date,
                         end_date,
                     )
-
                     continue
 
             logger.info("CITY END | %s", city)
